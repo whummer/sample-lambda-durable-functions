@@ -1,9 +1,19 @@
 import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } from "@aws-sdk/client-bedrock-agentcore";
 import { DurableContext, withDurableExecution } from "@aws/durable-execution-sdk-js";
+import Stripe from "stripe";
 
 const agentRuntimeArn = process.env.AGENT_RUNTIME_ARN;
 const agentRegion = process.env.AGENT_REGION || 'us-east-1';
 const client = new BedrockAgentCoreClient({ region: agentRegion });
+
+// Payment capture is only wired up when a Stripe key is configured (unset by default, so
+// existing deployments/tests are unaffected). STRIPE_HOST points the SDK at the LocalStack
+// Stripe extension (https://docs.localstack.cloud) instead of api.stripe.com for local testing.
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
+const stripeHost = process.env.STRIPE_HOST;
+const stripe = stripeSecretKey
+    ? new Stripe(stripeSecretKey, stripeHost ? { host: stripeHost, protocol: 'http', port: 4566 } : {})
+    : undefined;
 
 interface transaction {
     id: number;
@@ -21,6 +31,7 @@ interface TransactionResult {
         fraud_score?: number;
         result?: string;
         customerVerificationResult?: string;
+        chargeId?: string;
     };
 
 }
@@ -36,9 +47,26 @@ class fraudTransaction implements transaction {
     ) { }
 
     async authorize(tx: fraudTransaction, cusRejection: boolean = false, options?: { idempotency_key: string }): Promise<TransactionResult> {
-        //IMPLEMENT LOGIC TO AUTHORIZE TRANSCATION
+        // Capture payment via Stripe when configured (see STRIPE_SECRET_KEY above). Uses a
+        // fixed Stripe test card, since this is a demo with no real card-collection UI.
         // Best Practice: Use idempotency_key to prevent duplicate charges on step retries
-        // Example: payment.charges.create({ amount: tx.amount, idempotency_key: options?.idempotency_key })
+        let chargeId: string | undefined;
+        if (stripe) {
+            const paymentMethod = await stripe.paymentMethods.create({
+                type: 'card',
+                card: { number: '4242424242424242', exp_month: 12, exp_year: 2030, cvc: '123' },
+            });
+            const charge = await stripe.charges.create(
+                {
+                    amount: Math.round(tx.amount * 100), // Stripe amounts are in the smallest currency unit (cents)
+                    currency: 'usd',
+                    source: paymentMethod.id,
+                    description: `Transaction ${tx.id} - ${tx.vendor}`,
+                },
+                options?.idempotency_key ? { idempotencyKey: options.idempotency_key } : undefined
+            );
+            chargeId = charge.id;
+        }
 
         let result: TransactionResult = {
             statusCode: 200,
@@ -46,7 +74,8 @@ class fraudTransaction implements transaction {
                 transaction_id: tx.id,
                 amount: tx.amount,
                 fraud_score: tx.score,
-                result: 'authorized'
+                result: 'authorized',
+                ...(chargeId ? { chargeId } : {}),
             }
         };
 
