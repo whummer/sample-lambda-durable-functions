@@ -26,6 +26,73 @@ Transaction → Durable Lambda → Bedrock AgentCore Agent → Risk Score
 
 This project supports deployment through a SAM Template (Recommended) - Infrastructure as Code with CloudFormation
 
+## Local Development with LocalStack
+
+The whole stack - Bedrock AgentCore risk scoring (stubbed), the durable Lambda, and Stripe payment capture - can run entirely on [LocalStack](https://localstack.cloud) instead of real AWS, using the `Makefile` in this directory (`make help` for all targets, or the root repo `Makefile` with `APP=fraud-detection`).
+
+### Prerequisites
+
+- **LocalStack Pro**, with a recent build that supports [Lambda Durable Functions](https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html) (a very new AWS feature - if `make deploy` fails validating `DurableConfig`, or invokes fail with a durable-execution error, update to the latest `localstack/localstack-pro` image).
+- The [Stripe extension](https://docs.localstack.cloud) installed and enabled (`make install-stripe-extension`; requires a LocalStack Pro auth token).
+- `sam` CLI, recent enough to know about the `DurableConfig` property (`pip install --upgrade aws-sam-cli` if `sam deploy` reports `InvalidResourceException` on it).
+- Docker, `jq`, and the AWS CLI (v1 or v2 both work).
+
+### Deploy
+
+```bash
+make start                      # start LocalStack (skips if already running)
+make install-stripe-extension   # one-time
+make deploy                     # build the agent image + Lambda package, deploy the stack
+```
+
+`AWS::BedrockAgentCore::Runtime` isn't natively emulated yet - LocalStack accepts it via a generic fallback, so the risk-scoring agent container is pushed and the resource is created, but real `InvokeAgentRuntime` calls against it won't work. That's fine for testing: pass an explicit `score` in the invoke payload (see below) to skip the agent call entirely, which is exactly what the tests and the commands below do. If the agent *is* invoked (`score: 0` or omitted) and fails, the workflow already falls back to a default risk score rather than erroring out.
+
+By default `make deploy` points the `authorize` step's Stripe payment capture at the LocalStack Stripe extension rather than the real Stripe API, using a fixed Stripe test card - no real charge occurs and no Stripe account is needed. Pass `STRIPE_SECRET_KEY=` (empty) to skip payment capture entirely, or set a real key with `STRIPE_HOST=` (empty) to charge through real Stripe.
+
+### Run an end-to-end test
+
+**Low risk (auto-authorize + Stripe charge):**
+
+```bash
+make invoke TX_ID=1 AMOUNT=500 SCORE=1
+```
+
+Check the result and the resulting Stripe charge (`awslocal` below is the [`awscli-local`](https://github.com/localstack/awscli-local) wrapper; equivalently use `aws --endpoint-url=http://localhost.localstack.cloud:4566`):
+
+```bash
+make executions
+awslocal lambda get-durable-execution --durable-execution-arn <arn from above>
+```
+
+The result should show `"result":"authorized"` and a `chargeId` (e.g. `ch_...`) - confirm it in the Stripe mock with `curl -u sk_test_localstack: http://localhost.localstack.cloud:4566/stripe/v1/charges/<chargeId>`.
+
+**High risk (auto-escalate, no charge):**
+
+```bash
+make invoke TX_ID=2 AMOUNT=10000 SCORE=5
+```
+
+**Medium risk (suspend + human-in-the-loop callback):**
+
+```bash
+make invoke TX_ID=3 AMOUNT=6500 SCORE=3
+```
+
+The execution suspends waiting on parallel email/SMS callbacks. Get the callback ID from its history, then approve or reject it:
+
+```bash
+awslocal lambda get-durable-execution-history --durable-execution-arn <arn> --include-execution-data
+make callback CALLBACK_ID=<id from CallbackStartedDetails> STATUS=approve   # or STATUS=reject
+```
+
+The execution should then finalize to `SUCCEEDED` with `"customerVerificationResult":"TransactionApproved"` and a second Stripe charge.
+
+### Cleanup
+
+```bash
+make delete   # delete the CloudFormation stack
+make clean    # remove local build artifacts
+```
 
 ## Shell Compatibility
 
